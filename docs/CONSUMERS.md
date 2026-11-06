@@ -1,0 +1,107 @@
+# Client Configuration Guide (n8n, Hermes, Langflow, LangChain & OTLP Telemetry)
+
+> **Disclaimer:** This project is an independent community / field-engineering implementation built on top of Snowflake Cortex AI Gateway and Snowpark Container Services (SPCS). It is **NOT an official Snowflake product** and is released under the **[MIT License](../LICENSE)**.
+
+Assume your proxy service is reachable inside SPCS at:
+`ORIGIN = http://llm-proxy-standard.<namespace>.svc.spcs.internal:8080`
+
+Never paste a real Snowflake PAT into client UI fields on internal SPCS routes — use a dummy placeholder string (e.g., `internal-spcs`) because the proxy authenticates upstream using its mounted SPCS OAuth token (`/snowflake/session/token`).
+
+---
+
+## 1. n8n
+
+Create three credentials in n8n:
+
+1. **OpenAI API (Chat Completions):**
+   - **Base URL:** `ORIGIN/chat/v1`
+   - **API Key:** `internal-spcs`
+   - In the **OpenAI Chat Model** node, leave *Use Responses API* **OFF**.
+2. **OpenAI API (Responses API):**
+   - **Base URL:** `ORIGIN/responses/v1`
+   - **API Key:** `internal-spcs`
+   - In the **OpenAI Chat Model** node, turn *Use Responses API* **ON**. (The proxy automatically normalizes `store=false`, strips empty `"text": {}` objects, and rehydrates `reasoning.encrypted_content` across tool turns via `ReplayCache`).
+3. **Anthropic API (Messages API):**
+   - **Base URL:** `ORIGIN/messages`
+   - **API Key:** `internal-spcs`
+   - (The proxy automatically rehydrates `thinking` signatures across tool turns via `ReplayCache`).
+
+All three credentials dynamically populate the model dropdown from `GET /<protocol>/v1/models`.
+
+---
+
+## 2. Hermes Agent
+
+Add the three providers in `config.yaml` with `discover_models: true` (no static model lists needed):
+
+```yaml
+providers:
+  snowflake-standard-chat:
+    name: Snowflake-Standard-Chat
+    base_url: ORIGIN/chat/v1
+    api_key: internal-spcs
+    api_mode: chat_completions
+    discover_models: true
+  snowflake-standard-responses:
+    name: Snowflake-Standard-Responses
+    base_url: ORIGIN/responses/v1
+    api_key: internal-spcs
+    api_mode: codex_responses
+    discover_models: true
+  snowflake-standard-messages:
+    name: Snowflake-Standard-Messages
+    base_url: ORIGIN/messages
+    api_key: internal-spcs
+    api_mode: anthropic_messages
+    discover_models: true
+```
+
+Whenever a new model is promoted into the Registry, Hermes discovers it automatically on `/model` refresh.
+
+---
+
+## 3. Langflow / Native-Snowflake-Langflow
+
+Connect either standard Langflow model components or the native `Proxy - Chat`, `Proxy - Responses`, and `Proxy - Messages` components (`StandardChat`, `StandardResponses`, `StandardMessages`) to:
+
+- **Chat:** `ORIGIN/chat/v1`
+- **Responses:** `ORIGIN/responses/v1` (with `use_responses_api=True`; the proxy serves `response_stream="ordered-items"` for full `langchain-openai` streaming compatibility)
+- **Messages:** `ORIGIN/messages`
+
+### Langflow Component AST Loader & Environment Variables
+- Configure `LLM_PROXY_BASE_URL` (or `SNOWFLAKE_STANDARD_PROXY_ORIGIN`) to `http://<PROXY_SERVICE>.<DNS_NAMESPACE>:8080` and include the proxy hostname in `LANGFLOW_SSRF_ALLOWED_HOSTS`.
+- **Important for custom Langflow components:** Langflow's `eval_custom_component_code` AST evaluator only extracts top-level `ast.Import` and `ast.ImportFrom` statements (and ignores module-level `try ... except ImportError:` blocks). Always use a top-level import (`from lfx_snowflake import standard_langflow`) in component files so `standard_langflow` is bound in component method globals.
+
+---
+
+## 4. LangChain & LangGraph
+
+See [`examples/standard_clients.py`](../examples/standard_clients.py):
+
+```python
+from examples.standard_clients import langchain_model
+
+# Chat Completions
+chat_llm = langchain_model(ORIGIN, "your-chat-model-id", "chat")
+
+# OpenAI Responses API
+responses_llm = langchain_model(ORIGIN, "your-responses-model-id", "responses")
+
+# Anthropic Messages API
+messages_llm = langchain_model(ORIGIN, "your-messages-model-id", "messages")
+```
+
+---
+
+## 5. OpenTelemetry & OTLP Client Trace Export via the Proxy
+
+To correlate client spans (tool execution, retrieval, agent loops) with Cortex AI Gateway server spans inside `TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`:
+
+1. **Pass W3C & Gateway Headers on Inference Requests:**
+   - `traceparent`: `00-<32-hex-trace-id>-<16-hex-span-id>-01`
+   - `x-snowflake-ai-gateway-conversation-id`: `<session_or_conversation_id>`
+   - `snow-agent-name`: `<agent_identifier>` (e.g. `hermes-agent`, `langflow-agent`, `n8n-workflow`)
+2. **Export OTLP Client Spans to the Proxy:**
+   - **OTLP HTTP Traces Endpoint:** `ORIGIN/telemetry/v1/traces`
+   - Supported Content-Types: `application/json` (`{"resourceSpans": [...]}`) and `application/x-protobuf` (max `1 MiB`).
+   - The proxy injects the SPCS OAuth token and forwards the spans to `https://<account-host>/api/v2/aigateways/<gateway>/telemetry/v1/traces`.
