@@ -3,6 +3,8 @@ import asyncio
 import base64
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import re
@@ -29,14 +31,57 @@ _TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 _SAFE_TRACESTATE_RE = re.compile(r"^[\x20-\x7e]{1,512}$")
 _SAFE_CONV_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 _SAFE_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,64}$")
+_CLIENT_AGENT_TAG_RE = re.compile(r"^client:([A-Za-z0-9_.:@-]{1,64})$")
 MAX_TELEMETRY_BODY = 1024 * 1024
+_DURATION_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
 
 
-def _gateway_observability_headers(request_headers):
+def _parse_retry_after_seconds(headers):
+    """Extract a positive retry wait in seconds from upstream rate-limit headers."""
+    if not headers:
+        return None
+    now_epoch = time.time()
+    for name in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests",
+                 "anthropic-ratelimit-input-tokens-reset", "anthropic-ratelimit-tokens-reset",
+                 "anthropic-ratelimit-requests-reset"):
+        raw = (headers.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+            continue
+        except ValueError:
+            pass
+        parts = _DURATION_TOKEN_RE.findall(raw.lower())
+        if parts and "".join(num + unit for num, unit in parts) == raw.lower().replace(" ", ""):
+            mult = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+            total = sum(float(num) * mult[unit] for num, unit in parts)
+            if total > 0:
+                return total
+            continue
+        for parse_fn in (
+            lambda s: datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp(),
+            lambda s: parsedate_to_datetime(s).timestamp(),
+        ):
+            try:
+                delta = parse_fn(raw) - now_epoch
+                if delta > 0:
+                    return delta
+                break
+            except Exception:
+                pass
+    return None
+
+
+def _gateway_observability_headers(request_headers, *, synthesize_traceparent=False):
     forwarded = {}
     tp = request_headers.get("traceparent", "").strip()
     if tp and _TRACEPARENT_RE.match(tp):
         forwarded["traceparent"] = tp
+    elif synthesize_traceparent:
+        forwarded["traceparent"] = f"00-{uuid.uuid4().hex}-{uuid.uuid4().hex[:16]}-01"
     ts = request_headers.get("tracestate", "").strip()
     if ts and _SAFE_TRACESTATE_RE.match(ts):
         forwarded["tracestate"] = ts
@@ -48,6 +93,16 @@ def _gateway_observability_headers(request_headers):
     if conv_id and _SAFE_CONV_ID_RE.match(conv_id):
         forwarded["x-snowflake-ai-gateway-conversation-id"] = conv_id
     agent_name = request_headers.get("snow-agent-name", "").strip()
+    if not agent_name:
+        raw_auth = request_headers.get("authorization", "").strip()
+        bearer_val = raw_auth[7:].strip() if raw_auth.lower().startswith("bearer ") else ""
+        for candidate in (request_headers.get("x-api-key", "").strip(), bearer_val):
+            match = _CLIENT_AGENT_TAG_RE.match(candidate)
+            if match:
+                agent_name = match.group(1)
+                break
+    if not agent_name:
+        agent_name = os.environ.get("PROXY_DEFAULT_AGENT_NAME", "").strip()
     if agent_name and _SAFE_AGENT_NAME_RE.match(agent_name):
         forwarded["snow-agent-name"] = agent_name
     return forwarded
@@ -64,6 +119,7 @@ class Settings:
     max_body: int = 32 * 1024 * 1024
     max_response: int = 32 * 1024 * 1024
     send_timeout: float = 30
+    retry_delays: tuple = (3.0, 7.0, 15.0, 30.0, 45.0)
 
     def __post_init__(self):
         parsed = urlsplit(self.upstream)
@@ -156,8 +212,15 @@ class BoundedStreamingResponse(StreamingResponse):
                     await self.cleanup()
 
 
-def error(protocol, status, message, request_id, *, code=None, field=None):
-    kind = "invalid_request_error" if status < 500 else "api_error"
+def error(protocol, status, message, request_id, *, code=None, field=None, extra_headers=None):
+    if status == 429:
+        kind = "rate_limit_error"
+    elif status == 529:
+        kind = "overloaded_error"
+    elif status >= 500:
+        kind = "api_error"
+    else:
+        kind = "invalid_request_error"
     body = {"error": {"type": kind, "message": message}, "request_id": request_id}
     if code:
         body["error"]["code"] = code
@@ -165,7 +228,10 @@ def error(protocol, status, message, request_id, *, code=None, field=None):
         body["error"]["param"] = field
     if protocol == "messages":
         body["type"] = "error"
-    return JSONResponse(body, status_code=status, headers={"x-request-id": request_id})
+    resp_headers = {"x-request-id": request_id}
+    if extra_headers:
+        resp_headers.update(extra_headers)
+    return JSONResponse(body, status_code=status, headers=resp_headers)
 
 
 def create_app(settings, cache, *, transport=None):
@@ -263,7 +329,7 @@ def create_app(settings, cache, *, transport=None):
                     try:
                         await admission.acquire()
                     except (Unavailable, TimeoutError):
-                        return error(protocol, 429, "Bounded admission limit reached", request_id)
+                        return error(protocol, 429, "Bounded admission limit reached", request_id, extra_headers={"Retry-After": "2"})
                     acquired = True
                     raw = bytearray()
                     async for chunk in request.stream():
@@ -284,8 +350,9 @@ def create_app(settings, cache, *, transport=None):
                     current = cache.resolve(protocol, profile.id)
                     if current != profile:
                         raise Unavailable("Profile changed while waiting")
-                    retry_delays = (2.5, 6.0, 14.0, 25.0) if getattr(profile, "normalize_client_options", False) else ()
+                    retry_delays = tuple(settings.retry_delays) if getattr(profile, "normalize_client_options", False) else ()
                     prev_status = None
+                    last_retry_hint = None
                     for attempt_idx in range(len(retry_delays) + 1):
                         token = settings.token_path.read_text().strip()
                         if not token:
@@ -294,7 +361,10 @@ def create_app(settings, cache, *, transport=None):
                                    "Content-Type": "application/json", "Accept": "text/event-stream" if effective.get("stream") else "application/json"}
                         if protocol == "messages":
                             headers["anthropic-version"] = "2023-06-01"
-                        headers.update(_gateway_observability_headers(request.headers))
+                        headers.update(_gateway_observability_headers(
+                            request.headers,
+                            synthesize_traceparent=bool(settings.telemetry_upstream),
+                        ))
                         upstream = app.state.client.build_request("POST", settings.upstream + SUFFIX[protocol], json=effective, headers=headers)
                         response = await until_disconnect(request, app.state.client.send(upstream, stream=True))
                         if response.status_code not in {429, 503, 529} or attempt_idx >= len(retry_delays):
@@ -304,21 +374,30 @@ def create_app(settings, cache, *, transport=None):
                                                 "reason": "Transient upstream rate limit or overload", "effects": f"Retried {attempt_idx} time(s)"})
                             break
                         prev_status = response.status_code
-                        retry_after_raw = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset-requests")
+                        hinted = _parse_retry_after_seconds(response.headers)
+                        last_retry_hint = hinted
                         await response.aclose()
                         response = None
-                        delay = retry_delays[attempt_idx]
-                        if retry_after_raw:
-                            try:
-                                delay = max(0.01, min(30.0, float(retry_after_raw)))
-                            except ValueError:
-                                pass
+                        base_delay = retry_delays[attempt_idx]
+                        if hinted is not None:
+                            delay = min(90.0, hinted if attempt_idx == 0 else max(base_delay, hinted))
+                        else:
+                            delay = base_delay
                         if time.monotonic() + delay >= expires:
-                            return error(protocol, prev_status, f"Upstream HTTP {prev_status}; retry budget exceeded deadline", request_id)
+                            ra_hdr = {"Retry-After": str(max(1, int(round(hinted or 15.0))))} if prev_status in {429, 503, 529} else None
+                            return error(protocol, prev_status, f"Rate limit or overload persisted (upstream HTTP {prev_status}; retry budget exceeded deadline)", request_id, extra_headers=ra_hdr)
                         await until_disconnect(request, asyncio.sleep(delay))
                     if not 200 <= response.status_code < 300:
                         status = response.status_code if response.status_code >= 400 else 502
-                        return error(protocol, status, f"Upstream HTTP {response.status_code}; no retry or fallback", request_id)
+                        final_hint = _parse_retry_after_seconds(response.headers) or last_retry_hint
+                        if status in {429, 503, 529} and attempt_idx > 0:
+                            ra_secs = max(1, min(600, int(round(final_hint or 15.0))))
+                            msg = (f"Rate limit exceeded (upstream HTTP 429 persisted after {attempt_idx} proxy retries)"
+                                   if status == 429 else
+                                   f"Service temporarily overloaded (upstream HTTP {status} persisted after {attempt_idx} proxy retries)")
+                            return error(protocol, status, msg, request_id, extra_headers={"Retry-After": str(ra_secs)})
+                        ra_hdr = {"Retry-After": str(max(1, min(600, int(round(final_hint)))))} if status in {429, 503, 529} and final_hint else None
+                        return error(protocol, status, f"Upstream HTTP {response.status_code}; no retry or fallback", request_id, extra_headers=ra_hdr)
                     metadata = {"x-request-id": request_id, "x-proxy-revision": revision,
                                 "x-proxy-profile": digest(profile.document()), "Cache-Control": "no-store",
                                 "x-proxy-replica": replica, "x-proxy-release": release}
@@ -428,7 +507,7 @@ def create_app(settings, cache, *, transport=None):
                 try:
                     await admission.acquire()
                 except (Unavailable, TimeoutError):
-                    return error("chat", 429, "Bounded admission limit reached", request_id)
+                    return error("chat", 429, "Bounded admission limit reached", request_id, extra_headers={"Retry-After": "2"})
                 acquired = True
                 raw = bytearray()
                 async for chunk in request.stream():
@@ -480,7 +559,7 @@ def create_app(settings, cache, *, transport=None):
 
 
 def environment():
-    raw_host = os.environ["SNOWFLAKE_HOST"]
+    raw_host = os.environ.get("PROXY_UPSTREAM_HOST") or os.environ["SNOWFLAKE_HOST"]
     host = raw_host.replace("_", "-")
     if not re.fullmatch(r"[a-zA-Z0-9.-]+", host):
         raise ValueError("Invalid platform host")

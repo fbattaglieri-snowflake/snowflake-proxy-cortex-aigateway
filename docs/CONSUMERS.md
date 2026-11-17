@@ -3,9 +3,9 @@
 > **Disclaimer:** This project is an independent community / field-engineering implementation built on top of Snowflake Cortex AI Gateway and Snowpark Container Services (SPCS). It is **NOT an official Snowflake product** and is released under the **[MIT License](../LICENSE)**.
 
 Assume your proxy service is reachable inside SPCS at:
-`ORIGIN = http://llm-proxy-standard.<namespace>.svc.spcs.internal:8080`
+`ORIGIN = http://llm-proxy-aigateway.<namespace>.svc.spcs.internal:8080`
 
-Never paste a real Snowflake PAT into client UI fields on internal SPCS routes — use a dummy placeholder string (e.g., `internal-spcs`) because the proxy authenticates upstream using its mounted SPCS OAuth token (`/snowflake/session/token`).
+Never paste a real Snowflake PAT into client UI fields on internal SPCS routes — use a dummy placeholder string such as `client:<agent-name>` (e.g., `client:n8n-spcs` or `client:hermes-agent`). The proxy authenticates upstream using its mounted SPCS OAuth token (`/snowflake/session/token`), never forwards the client API key upstream, and automatically maps `client:<agent-name>` to the `snow-agent-name` observability header in `TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`.
 
 ---
 
@@ -15,15 +15,15 @@ Create three credentials in n8n:
 
 1. **OpenAI API (Chat Completions):**
    - **Base URL:** `ORIGIN/chat/v1`
-   - **API Key:** `internal-spcs`
+   - **API Key:** `client:n8n-spcs`
    - In the **OpenAI Chat Model** node, leave *Use Responses API* **OFF**.
 2. **OpenAI API (Responses API):**
    - **Base URL:** `ORIGIN/responses/v1`
-   - **API Key:** `internal-spcs`
+   - **API Key:** `client:n8n-spcs`
    - In the **OpenAI Chat Model** node, turn *Use Responses API* **ON**. (The proxy automatically normalizes `store=false`, strips empty `"text": {}` objects, and rehydrates `reasoning.encrypted_content` across tool turns via `ReplayCache`).
 3. **Anthropic API (Messages API):**
    - **Base URL:** `ORIGIN/messages`
-   - **API Key:** `internal-spcs`
+   - **API Key:** `client:n8n-spcs`
    - (The proxy automatically rehydrates `thinking` signatures across tool turns via `ReplayCache`, converts `thinking.type="enabled"` to `"adaptive"` + `output_config={"effort": "medium"}` on Claude 5.x models, upgrades small client default `max_tokens` (`omitted`/`1024`/`1500`/`2048`/`3072`/`4096`) to `32768` on mandatory-adaptive models such as `claude-fable-5-2` and `claude-opus-5-5`, and synthesizes missing `content_block_stop` SSE frames if a block is truncated mid-stream).
 
 All three credentials dynamically populate the model dropdown from `GET /<protocol>/v1/models`.

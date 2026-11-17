@@ -424,3 +424,18 @@ class MultiRoundTests(unittest.IsolatedAsyncioTestCase):
         # Reject invalid OTLP JSON payload
         bad_tel = await self.http.post('/telemetry/v1/traces', json={'invalid': True})
         self.assertEqual(bad_tel.status_code, 400)
+
+        # Synthesize W3C traceparent when omitted and extract client:<agent-name> tag from Bearer / x-api-key
+        auto_res = await self.http.post(
+            '/chat/v1/chat/completions',
+            json={
+                'model': 'fixture-chat',
+                'messages': [{'role': 'user', 'content': 'auto-trace'}],
+            },
+            headers={'Authorization': 'Bearer client:n8n-spcs'},
+        )
+        self.assertEqual(auto_res.status_code, 200)
+        auto_sent = self.requests[-1]
+        self.assertRegex(auto_sent.headers['traceparent'], r'^00-[0-9a-f]{32}-[0-9a-f]{16}-01$')
+        self.assertEqual(auto_sent.headers['snow-agent-name'], 'n8n-spcs')
+        self.assertEqual(auto_sent.headers['authorization'], 'Bearer synthetic-token-first')

@@ -9,6 +9,7 @@ spec:
         PROXY_ARTIFACT: ${APPROVED_ARTIFACT_SHA256}
         PROXY_GATEWAY_NAME: ${APPROVED_AI_GATEWAY_NAME:-snowflake}
         PROXY_UPSTREAM_PATH: /api/v2/aigateways/${APPROVED_AI_GATEWAY_NAME:-snowflake}/v1
+        PROXY_DEFAULT_AGENT_NAME: ${APPROVED_DEFAULT_AGENT_NAME:-spcs-proxy}
         PROXY_TRUST_FILE: /config/trust.json
         PROXY_REGISTRY_URL: ${APPROVED_PRIVATE_REGISTRY_ORIGIN}/snapshot
       volumeMounts:

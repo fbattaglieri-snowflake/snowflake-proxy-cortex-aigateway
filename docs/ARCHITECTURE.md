@@ -26,12 +26,12 @@ Inside Snowpark Container Services, Snowflake mounts a rotated OAuth token at `/
 
 ## 3. W3C Trace Context & Gateway Observability Header Propagation
 
-To enable unified client + server trace correlation in `TABLE(AGENT_TRACE_TABLE('<GATEWAY>'))`, `app.py` (`_gateway_observability_headers`) validates and forwards four optional observability headers while stripping all untrusted client headers (`x-api-key`, `x-user`, etc.):
+To enable unified client + server trace correlation in `TABLE(AGENT_TRACE_TABLE('<GATEWAY>'))`, `app.py` (`_gateway_observability_headers`) validates, synthesizes, and forwards four observability headers while stripping all untrusted client headers (`x-api-key`, client `authorization`, `x-user`, etc.):
 
-1. **`traceparent`** (`^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`): W3C Trace Context ID linking client spans and Cortex AI Gateway server spans under a single `trace_id`.
+1. **`traceparent`** (`^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`): W3C Trace Context ID linking client spans and Cortex AI Gateway server spans under a single `trace_id`. When omitted by standard SDKs or n8n nodes on inference routes, the proxy automatically synthesizes a valid 128-bit W3C `traceparent` (`00-<32hex>-<16hex>-01`) so server spans never fall back to zero-prefixed standalone trace IDs.
 2. **`tracestate`** (`^[\x20-\x7e]{1,512}$`): W3C vendor trace state.
 3. **`x-snowflake-ai-gateway-conversation-id`** (`^[A-Za-z0-9_.:@-]{1,128}$`): Session/conversation correlation ID stored in `RECORD_ATTRIBUTES:"gen_ai.conversation.id"` (also mapped automatically if the client sends `x-claude-code-session-id` or `x-conversation-id`).
-4. **`snow-agent-name`** (`^[A-Za-z0-9_.:@-]{1,64}$`): Agent identifier stored in `RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"`.
+4. **`snow-agent-name`** (`^[A-Za-z0-9_.:@-]{1,64}$`): Agent identifier stored in `RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"`. If the client cannot set custom HTTP headers (such as standard n8n OpenAI/Anthropic credentials), setting the internal dummy API key to `client:<agent-name>` (e.g. `client:n8n-spcs`) automatically populates `snow-agent-name` without ever forwarding the client credential upstream, falling back to `PROXY_DEFAULT_AGENT_NAME` when configured.
 
 ## 4. Universal Client Normalization (`rules.py`)
 
@@ -49,13 +49,17 @@ When `ProfileV2.normalize_client_options = True`, the proxy transparently normal
    - Converts `max_tokens` &rarr; `max_completion_tokens` when `max_completion_tokens` is absent (`rename-max-tokens-to-completion`), and resolves conflicts when a client sends both (`dedup-max-tokens`).
    - Sets `reasoning_effort = "none"` when required by a profile (even if the client sends `"medium"` or omits it), and removes `reasoning_effort` on Chat models that do not support it.
 4. **Messages Protocol Adjustments:**
-   - When `thinking.type` is outside the profile's supported enum (for example `"adaptive"` sent by clients before profile negotiation), strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.
-   - When `thinking.type == "enabled"`, strips incompatible `temperature` / `top_p` parameters and bumps `max_tokens` if `max_tokens <= thinking.budget_tokens`.
+   - On Claude 5.x models supporting `adaptive` thinking, converts `thinking.type = "enabled"` to `"adaptive"` + `output_config = {"effort": "medium"}` and upgrades small client default `max_tokens` (`omitted`/`1024`/`1500`/`2048`/`3072`/`4096`) to `32768` on mandatory-adaptive models (`claude-fable-5-2`, `claude-opus-5-5`). When `thinking.type` is outside a profile's supported enum, strips the unsupported `thinking` block and paired `output_config.effort` instead of failing with `HTTP 400`.
+   - When `thinking` is active, strips incompatible `temperature` / `top_p` parameters, bumps `max_tokens` if `max_tokens <= thinking.budget_tokens`, and synthesizes missing `content_block_stop` SSE frames if a block is truncated mid-stream.
    - Normalizes string `tool_choice` (`"auto"` / `"none"`) to `{"type": ...}`.
 5. **Multi-Round Tool Call ID Deduplication:**
    - Automatically renames reused tool call IDs (`call_0..call_N`) from prior closed turns (`call_0` -> `call_0_r2`) in both the assistant turn and matching tool result.
 6. **1M+ Token Context & Long-Stream Resource Bounds (`app.py`):**
    - Defaults `max_body = 32 MiB` (`PROXY_MAX_BODY=33554432`), `max_response = 32 MiB` (`PROXY_MAX_RESPONSE=33554432`), `deadline = 600s` (`PROXY_DEADLINE=600`), and upstream `httpx.Timeout(180, connect=10, write=60, pool=5)` so 1M+ token context windows (`openai-gpt-6-astra`, `openai-gpt-6.1-sol`, `claude-opus-5-5`) with multi-round `reasoning.encrypted_content` blobs and long context-compression streams complete without premature `HTTP 413` rejections or mid-stream cutoff.
+7. **Upstream Rate-Limit & Overload Resilience (`app.py`):**
+   - On `ProfileV2` (`normalize_client_options = True`), transparently retries transient upstream `HTTP 429`, `503`, and `529` responses across a 100-second exponential schedule (`3s, 7s, 15s, 30s, 45s`) while observing client disconnects (`until_disconnect`) and recording `upstream-rate-limit-retry` in `x-proxy-adjustments`.
+   - Parses numeric, Go-style duration (`1m10s`, `500ms`), ISO-8601 (`anthropic-ratelimit-*-reset`), and RFC 7231 HTTP-date reset headers without allowing zero or sub-window `Retry-After` hints to collapse subsequent backoff steps.
+   - If upstream throttling persists past all proxy retries, emits standard `error.type = "rate_limit_error"` on `429` (`"overloaded_error"` on `529`) and forwards a `Retry-After` header so downstream agent loops (`Hermes`, `LangChain`, `n8n`, `Langflow`) classify and back off cleanly.
 
 ## 5. Stateless Client `ReplayCache` (`replay_cache.py`)
 
