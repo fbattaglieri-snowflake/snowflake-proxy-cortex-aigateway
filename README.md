@@ -244,17 +244,17 @@ When a consumer calls `llm-proxy-aigateway (:8080)`, `_gateway_observability_hea
 - **`traceparent`** (`^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`): Forwarded when supplied by the client, or **synthesized automatically** (`00-<32hex>-<16hex>-01`) on inference requests when omitted by standard SDKs/n8n nodes so every span in `TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))` carries a full 128-bit W3C `trace_id`.
 - **`tracestate`**: W3C vendor trace state.
 - **`x-snowflake-ai-gateway-conversation-id`** (also mapped automatically from `x-claude-code-session-id` or `x-conversation-id`): populates `RECORD_ATTRIBUTES:"gen_ai.conversation.id"` in `AGENT_TRACE_TABLE`.
-- **`snow-agent-name`**: Forwarded from `snow-agent-name` header, or **extracted automatically** when an internal consumer sets its credential API key to `client:<agent-name>` (e.g. `client:n8n-spcs`, `client:hermes-agent` — never sent upstream as an API key!), falling back to `PROXY_DEFAULT_AGENT_NAME`. Populates `RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"`.
+- **`snow-agent-name` & W3C `baggage` (`gen_ai.agent.id`, `gen_ai.agent.name`)**: Forwarded from `snow-agent-name`, or **extracted automatically** when an internal consumer sets its credential API key to `client:<agent-name>` (e.g. `client:n8n-spcs`, `client:hermes-spcs` — never sent upstream as an API key!), falling back to `PROXY_DEFAULT_AGENT_NAME`. Automatically populates **both** `RECORD_ATTRIBUTES:"gen_ai.agent.id"`, `RECORD_ATTRIBUTES:"gen_ai.agent.name"` (used by Snowsight AI Gateway Trace Analytics) and `RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"`.
 
-### 6.2 Internal OTLP Client Trace Pass-Through (`POST /telemetry/v1/traces`)
+### 6.2 OTLP Client Trace Pass-Through (`POST /telemetry/v1/traces`)
 
-Internal SPCS services do not need static PATs to export OpenTelemetry client spans (tool execution latency, retrieval steps, or orchestrator spans). Point any standard OTLP HTTP exporter to:
+When `PROXY_UPSTREAM_HOST` points to an endpoint mounting `/api/v2/aigateways/<gateway>/telemetry/v1/traces`, OTLP HTTP exporters (`application/json` or `application/x-protobuf`, up to `1 MiB`) can send custom client spans through:
 
 ```text
 http://llm-proxy-aigateway.<namespace>.svc.spcs.internal:8080/telemetry/v1/traces
 ```
 
-The proxy validates the OTLP payload (`application/json` or `application/x-protobuf`, up to `1 MiB`), attaches the rotating SPCS OAuth token from `/snowflake/session/token`, and forwards it to `https://<account-host>/api/v2/aigateways/<gateway>/telemetry/v1/traces`.
+*(Note: Inside SPCS, server-side inference spans on `/api/v2/aigateways/<gateway>/v1/*` are captured automatically via `/snowflake/session/token`. Exporting standalone client-side OTLP spans directly to `<public-gateway-endpoint>/telemetry/v1/traces` uses an external PAT via `Authorization: Bearer <PAT>`.)*
 
 ### 6.3 Querying Spans in `TABLE(AGENT_TRACE_TABLE('SNOWFLAKE'))`
 
@@ -265,7 +265,10 @@ SELECT
   RECORD:"name"::STRING AS SPAN_NAME,
   RECORD_ATTRIBUTES:"gen_ai.request.model"::STRING AS MODEL,
   RECORD_ATTRIBUTES:"gen_ai.conversation.id"::STRING AS CONVERSATION_ID,
-  RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"::STRING AS AGENT_NAME,
+  COALESCE(
+    RECORD_ATTRIBUTES:"gen_ai.agent.name"::STRING,
+    RECORD_ATTRIBUTES:"http.request.header.snow-agent-name"::STRING
+  ) AS AGENT_NAME,
   RECORD_ATTRIBUTES:"gen_ai.usage.input_tokens"::INT AS INPUT_TOKENS,
   RECORD_ATTRIBUTES:"gen_ai.usage.output_tokens"::INT AS OUTPUT_TOKENS,
   RECORD_ATTRIBUTES:"http.response.status_code"::INT AS HTTP_STATUS

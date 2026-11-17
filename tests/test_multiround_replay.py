@@ -389,6 +389,7 @@ class MultiRoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.headers['tracestate'], 'vendor=test')
         self.assertEqual(sent.headers['x-snowflake-ai-gateway-conversation-id'], 'conv-session-01')
         self.assertEqual(sent.headers['snow-agent-name'], 'hermes-spcs-agent')
+        self.assertEqual(sent.headers['baggage'], 'gen_ai.agent.id=hermes-spcs-agent,gen_ai.agent.name=hermes-spcs-agent')
         self.assertNotIn('x-api-key', sent.headers)
 
         # Configure mock handler to also handle /telemetry/v1/traces
@@ -438,4 +439,5 @@ class MultiRoundTests(unittest.IsolatedAsyncioTestCase):
         auto_sent = self.requests[-1]
         self.assertRegex(auto_sent.headers['traceparent'], r'^00-[0-9a-f]{32}-[0-9a-f]{16}-01$')
         self.assertEqual(auto_sent.headers['snow-agent-name'], 'n8n-spcs')
+        self.assertEqual(auto_sent.headers['baggage'], 'gen_ai.agent.id=n8n-spcs,gen_ai.agent.name=n8n-spcs')
         self.assertEqual(auto_sent.headers['authorization'], 'Bearer synthetic-token-first')

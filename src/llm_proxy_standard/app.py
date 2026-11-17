@@ -29,6 +29,7 @@ SUFFIX = {"chat": "/chat/completions", "responses": "/responses", "messages": "/
 UPSTREAM_PATH_RE = re.compile(r"^/api/v2/(?:aigateways/[A-Za-z0-9_.-]+|cortex)/v1$")
 _TRACEPARENT_RE = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 _SAFE_TRACESTATE_RE = re.compile(r"^[\x20-\x7e]{1,512}$")
+_SAFE_BAGGAGE_RE = re.compile(r"^[\x20-\x7e]{1,512}$")
 _SAFE_CONV_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 _SAFE_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,64}$")
 _CLIENT_AGENT_TAG_RE = re.compile(r"^client:([A-Za-z0-9_.:@-]{1,64})$")
@@ -103,8 +104,19 @@ def _gateway_observability_headers(request_headers, *, synthesize_traceparent=Fa
                 break
     if not agent_name:
         agent_name = os.environ.get("PROXY_DEFAULT_AGENT_NAME", "").strip()
+    raw_baggage = request_headers.get("baggage", "").strip()
+    baggage_parts = [raw_baggage] if raw_baggage and _SAFE_BAGGAGE_RE.match(raw_baggage) else []
     if agent_name and _SAFE_AGENT_NAME_RE.match(agent_name):
         forwarded["snow-agent-name"] = agent_name
+        joined = ",".join(baggage_parts)
+        if "gen_ai.agent.id=" not in joined:
+            baggage_parts.append(f"gen_ai.agent.id={agent_name}")
+        if "gen_ai.agent.name=" not in joined:
+            baggage_parts.append(f"gen_ai.agent.name={agent_name}")
+    if baggage_parts:
+        candidate_baggage = ",".join(baggage_parts)
+        if _SAFE_BAGGAGE_RE.match(candidate_baggage):
+            forwarded["baggage"] = candidate_baggage
     return forwarded
 
 
